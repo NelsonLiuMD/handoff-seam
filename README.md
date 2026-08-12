@@ -10,7 +10,7 @@ longer match.
 Built for parallel coding-agent workflows (multiple sessions, multiple
 worktrees of the same repository), where the failure mode is silent: a session
 resumes from a perfectly plausible handoff that describes *a different place or
-time*, and drifts without anyone noticing.
+time* — stale context, the wrong worktree — and drifts without anyone noticing.
 
 ## The problem
 
