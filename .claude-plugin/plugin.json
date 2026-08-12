@@ -1,6 +1,6 @@
 {
   "name": "handoff-seam",
-  "description": "Fail-closed handoff/resume identity seam: binds session handoff notes to the exact git worktree, commit, and dirty-state fingerprint, and rejects re-entry when they no longer match.",
+  "description": "Verify session handoff notes before resuming: seals them to the exact git worktree, commit, and uncommitted changes, and refuses stale or wrong-worktree context.",
   "version": "0.1.0",
   "author": {
     "name": "Nelson Liu"
