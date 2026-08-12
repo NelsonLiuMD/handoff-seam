@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""handoff-seam: bind handoff notes to the exact git state they describe.
+
+A handoff file (session notes an agent or human writes before stopping) is only
+safe to act on if the world it describes still exists. This tool seals a
+machine-readable identity seam into the file — physical worktree path, git
+common directory, per-worktree git directory, full ref or detached state, full
+commit OID, and a dirty-state content fingerprint — and refuses re-entry when
+any of them no longer match. Verification is fail-closed: the prose is not
+surfaced unless the seam matches.
+
+Subcommands:
+    capture             Print the current seam JSON for a repository.
+    seal FILE           Seal FILE (in place) to the current git state.
+    verify FILE         Recompute the seam and compare against FILE's seal.
+    read FILE           Verify, then print FILE only if the seam matches.
+
+Exit codes:
+    0   seam matches
+    1   state drift (one or more seam fields no longer match)
+    2   structural or usage failure (missing/malformed seam, moved file,
+        size cap exceeded, not a git worktree, unborn HEAD, bad arguments)
+
+Requires: git, python3 >= 3.8. Never mutates the repository (git runs with
+GIT_OPTIONAL_LOCKS=0). Never invokes a model, never reads transcripts.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import stat
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+SCHEMA_VERSION = 1
+MARKER_OPEN = "<!-- handoff-seam-v1 -->"
+MARKER_CLOSE = "<!-- /handoff-seam-v1 -->"
+RESUME_HEADING = "## Resume seam"
+
+MAX_HANDOFF_BYTES = 262_144
+MAX_STATUS_BYTES = 2_000_000
+MAX_DIFF_BYTES = 25_000_000
+MAX_UNTRACKED_BYTES = 25_000_000
+DEADLINE_SECONDS = 30.0
+
+OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+
+EXPECTED_KEYS = {
+    "branch_ref",
+    "dirty",
+    "git_common_dir",
+    "handoff_path",
+    "head_oid",
+    "schema_version",
+    "session_id",
+    "status_sha256",
+    "worktree_git_dir",
+    "worktree_root",
+}
+# Compared field-by-field against a fresh capture; the remaining keys are
+# validated structurally (handoff_path, schema_version) or on demand (session_id).
+CORE_KEYS = (
+    "branch_ref",
+    "dirty",
+    "git_common_dir",
+    "head_oid",
+    "status_sha256",
+    "worktree_git_dir",
+    "worktree_root",
+)
+
+
+class SeamError(Exception):
+    """Structural or usage failure. Exit 2."""
+
+
+class SeamMismatch(Exception):
+    """The sealed seam no longer matches reality. Exit 1."""
+
+    def __init__(self, diffs):
+        self.diffs = diffs
+        super().__init__("seam mismatch")
+
+
+class Deadline:
+    def __init__(self, seconds):
+        self._until = time.monotonic() + seconds
+
+    def remaining(self):
+        left = self._until - time.monotonic()
+        if left <= 0:
+            raise SeamError("git capture exceeded its %ss deadline" % DEADLINE_SECONDS)
+        return left
+
+
+def _git_env():
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def _single_line(value, what):
+    if value.endswith("\n"):
+        value = value[:-1]
+    if any(ch in value for ch in "\n\r\0"):
+        raise SeamError("git returned a multi-line %s" % what)
+    return value
+
+
+def git_text(anchor, args, deadline, what):
+    try:
+        completed = subprocess.run(
+            ["git", "-C", anchor] + args,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_git_env(),
+            timeout=deadline.remaining(),
+        )
+    except subprocess.CalledProcessError:
+        raise SeamError("git %s failed for %s" % (" ".join(args), what))
+    except subprocess.TimeoutExpired:
+        raise SeamError("git %s timed out" % " ".join(args))
+    return _single_line(completed.stdout.decode("utf-8", errors="strict"), what)
+
+
+def git_bytes(anchor, args, limit, deadline, what):
+    """Run git, streaming stdout with a hard size cap. Fail closed on excess."""
+    process = subprocess.Popen(
+        ["git", "-C", anchor] + args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=_git_env(),
+    )
+    output = bytearray()
+    try:
+        descriptor = process.stdout.fileno()
+        while True:
+            deadline.remaining()
+            chunk = os.read(descriptor, min(65_536, limit + 1 - len(output)))
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > limit:
+                raise SeamError("%s output exceeded its %dB cap" % (what, limit))
+        if process.wait(timeout=deadline.remaining()) != 0:
+            raise SeamError("git %s failed for %s" % (args[0], what))
+        return bytes(output)
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+
+
+def capture_seam(anchor_dir, exclusions):
+    """Capture the physical identity seam of the worktree containing anchor_dir."""
+    deadline = Deadline(DEADLINE_SECONDS)
+    anchor_dir = os.path.realpath(anchor_dir)
+    if not os.path.isdir(anchor_dir):
+        raise SeamError("not a directory: %s" % anchor_dir)
+
+    try:
+        toplevel = git_text(
+            anchor_dir, ["rev-parse", "--show-toplevel"], deadline, "worktree root"
+        )
+    except SeamError:
+        raise SeamError("not inside a git worktree: %s" % anchor_dir)
+    root = os.path.realpath(toplevel)
+
+    common_raw = git_text(root, ["rev-parse", "--git-common-dir"], deadline, "common dir")
+    if not os.path.isabs(common_raw):
+        common_raw = os.path.join(root, common_raw)
+    git_common_dir = os.path.realpath(common_raw)
+
+    worktree_git_dir = os.path.realpath(
+        git_text(root, ["rev-parse", "--absolute-git-dir"], deadline, "git dir")
+    )
+
+    try:
+        head_oid = git_text(
+            root, ["rev-parse", "--verify", "HEAD^{commit}"], deadline, "HEAD"
+        )
+    except SeamError:
+        raise SeamError(
+            "repository has no commit on HEAD (unborn branch?): "
+            "there is no immutable state to seal"
+        )
+    if not OID_RE.match(head_oid):
+        raise SeamError("unexpected HEAD object id: %r" % head_oid)
+
+    branch = subprocess.run(
+        ["git", "-C", root, "symbolic-ref", "-q", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=_git_env(),
+        timeout=deadline.remaining(),
+    )
+    if branch.returncode == 0:
+        branch_ref = _single_line(
+            branch.stdout.decode("utf-8", errors="strict"), "branch ref"
+        )
+        if not branch_ref.startswith("refs/"):
+            raise SeamError("unexpected symbolic ref: %r" % branch_ref)
+    elif branch.returncode == 1:
+        branch_ref = None
+    else:
+        raise SeamError("git symbolic-ref failed")
+
+    pathspec = ["--", "."] + list(exclusions)
+    status_bytes = git_bytes(
+        root,
+        [
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ]
+        + pathspec,
+        MAX_STATUS_BYTES,
+        deadline,
+        "status",
+    )
+    diff_bytes = git_bytes(
+        root,
+        [
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--ignore-submodules=none",
+            "--submodule=short",
+            "HEAD",
+        ]
+        + pathspec,
+        MAX_DIFF_BYTES,
+        deadline,
+        "diff",
+    )
+
+    fingerprint = hashlib.sha256()
+    fingerprint.update(b"status\0")
+    fingerprint.update(status_bytes)
+    fingerprint.update(b"diff\0")
+    fingerprint.update(diff_bytes)
+
+    untracked = []
+    skip_next = False  # a "2 " (rename/copy) record is followed by its origPath chunk
+    for record in status_bytes.split(b"\0"):
+        if skip_next:
+            skip_next = False
+            continue
+        if record.startswith(b"? "):
+            untracked.append(record[2:])
+            continue
+        if record.startswith((b"1 ", b"2 ", b"u ")):
+            fields = record.split(b" ", 4)
+            if len(fields) < 3:
+                raise SeamError("unparseable git status record")
+            if fields[2].startswith(b"S"):
+                raise SeamError(
+                    "dirty submodule state cannot be fingerprinted shallowly; "
+                    "commit or clean the submodule first"
+                )
+            if record.startswith(b"2 "):
+                skip_next = True
+
+    untracked_total = 0
+    root_bytes = os.fsencode(root)
+    for relative in sorted(untracked):
+        if not relative or relative.startswith(b"/") or b"\0" in relative:
+            raise SeamError("unexpected untracked path from git status")
+        path = os.path.join(root_bytes, relative)
+        metadata = os.lstat(path)
+        fingerprint.update(b"untracked\0" + relative + b"\0")
+        fingerprint.update(str(stat.S_IMODE(metadata.st_mode)).encode() + b"\0")
+        if stat.S_ISREG(metadata.st_mode):
+            untracked_total += metadata.st_size
+            if untracked_total > MAX_UNTRACKED_BYTES:
+                raise SeamError(
+                    "untracked content exceeds the %dB fingerprint budget"
+                    % MAX_UNTRACKED_BYTES
+                )
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode) or (
+                    opened.st_dev,
+                    opened.st_ino,
+                ) != (metadata.st_dev, metadata.st_ino):
+                    raise SeamError("untracked file changed while fingerprinting")
+                while True:
+                    deadline.remaining()
+                    chunk = os.read(descriptor, 65_536)
+                    if not chunk:
+                        break
+                    fingerprint.update(chunk)
+            finally:
+                os.close(descriptor)
+        elif stat.S_ISLNK(metadata.st_mode):
+            fingerprint.update(b"symlink\0" + os.readlink(path))
+        else:
+            fingerprint.update(b"special\0")
+
+    return {
+        "branch_ref": branch_ref,
+        "dirty": bool(status_bytes),
+        "git_common_dir": git_common_dir,
+        "head_oid": head_oid,
+        "status_sha256": fingerprint.hexdigest(),
+        "worktree_git_dir": worktree_git_dir,
+        "worktree_root": root,
+    }
+
+
+def exclusions_for(worktree_root, handoff_real):
+    """Pathspecs keeping the sealed file (and sibling handoffs) out of the seam.
+
+    Sealing writes into the file, so the file must not be part of its own
+    fingerprint. Sibling `handoff-*.md` files and crashed-seal temp files in
+    the same directory are excluded too, so sequential handoffs don't
+    invalidate each other.
+    """
+    relative = os.path.relpath(handoff_real, worktree_root)
+    if relative.startswith(".."):
+        raise SeamError(
+            "handoff file %s is not inside worktree %s" % (handoff_real, worktree_root)
+        )
+    directory = os.path.dirname(relative)
+
+    def scoped(pattern):
+        return pattern if not directory else "%s/%s" % (directory, pattern)
+
+    return [
+        ":(exclude,literal)%s" % relative,
+        ":(exclude,glob)%s" % scoped("handoff-*.md"),
+        ":(exclude,glob)%s" % scoped(".handoff-seam-*"),
+    ]
+
+
+def read_handoff(path):
+    """Read the handoff file defensively. Returns (text, lstat result)."""
+    metadata = os.lstat(path)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SeamError("handoff must be a regular file (no symlinks): %s" % path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise SeamError("handoff file changed while reading: %s" % path)
+        chunks = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 65_536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_HANDOFF_BYTES:
+                raise SeamError(
+                    "handoff exceeds the %dB cap: %s" % (MAX_HANDOFF_BYTES, path)
+                )
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        text = b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        raise SeamError("handoff is not valid UTF-8: %s" % path)
+    return text, metadata
+
+
+def parse_seam(text, path):
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines) if line == MARKER_OPEN]
+    if not starts:
+        raise SeamError("no seam block in %s (seal it first)" % path)
+    if len(starts) != 1:
+        raise SeamError("expected exactly one seam block in %s, found %d" % (path, len(starts)))
+    start = starts[0]
+    if start + 2 >= len(lines) or lines[start + 2] != MARKER_CLOSE:
+        raise SeamError("malformed seam block in %s" % path)
+    try:
+        seam = json.loads(lines[start + 1])
+    except ValueError:
+        raise SeamError("seam manifest in %s is not valid JSON" % path)
+    if not isinstance(seam, dict) or set(seam) != EXPECTED_KEYS:
+        raise SeamError("seam manifest in %s has an unexpected key set" % path)
+    if seam["schema_version"] != SCHEMA_VERSION:
+        raise SeamError(
+            "unsupported seam schema_version %r in %s" % (seam["schema_version"], path)
+        )
+    if not isinstance(seam["dirty"], bool):
+        raise SeamError("seam field 'dirty' must be a boolean in %s" % path)
+    if seam["branch_ref"] is not None and not (
+        isinstance(seam["branch_ref"], str) and seam["branch_ref"].startswith("refs/")
+    ):
+        raise SeamError("seam field 'branch_ref' must be null or a refs/ path in %s" % path)
+    for key in (
+        "git_common_dir",
+        "handoff_path",
+        "head_oid",
+        "session_id",
+        "status_sha256",
+        "worktree_git_dir",
+        "worktree_root",
+    ):
+        if not isinstance(seam[key], str) or not seam[key]:
+            raise SeamError("seam field %r must be a non-empty string in %s" % (key, path))
+    if not OID_RE.match(seam["head_oid"]):
+        raise SeamError("seam field 'head_oid' is not a full commit id in %s" % path)
+    if not SHA256_RE.match(seam["status_sha256"]):
+        raise SeamError("seam field 'status_sha256' is not a sha256 hex digest in %s" % path)
+    if not SESSION_ID_RE.match(seam["session_id"]):
+        raise SeamError("seam field 'session_id' is malformed in %s" % path)
+    for key in ("git_common_dir", "handoff_path", "worktree_git_dir", "worktree_root"):
+        if not os.path.isabs(seam[key]):
+            raise SeamError("seam field %r must be an absolute path in %s" % (key, path))
+    return seam
+
+
+def verify_file(handoff_path, anchor_dir, expected_session_id=None):
+    """Verify handoff_path against a fresh capture. Returns (seam, text)."""
+    text, _metadata = read_handoff(handoff_path)
+    seam = parse_seam(text, handoff_path)
+
+    actual = os.path.realpath(handoff_path)
+    if seam["handoff_path"] != actual:
+        raise SeamError(
+            "handoff file identity broken: sealed at %s, verifying %s "
+            "(moved or copied files cannot be trusted)" % (seam["handoff_path"], actual)
+        )
+
+    diffs = []
+    if expected_session_id is not None and seam["session_id"] != expected_session_id:
+        diffs.append(("session_id", seam["session_id"], expected_session_id))
+
+    exclusions = exclusions_for(seam["worktree_root"], actual)
+    current = capture_seam(anchor_dir, exclusions)
+    for key in CORE_KEYS:
+        if seam[key] != current[key]:
+            diffs.append((key, seam[key], current[key]))
+    if diffs:
+        raise SeamMismatch(diffs)
+    return seam, text
+
+
+def _describe(value):
+    if value is None:
+        return "(detached)"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+def atomic_replace(target_real, target_lstat, encoded, mode):
+    """Write encoded to target_real atomically, refusing if the file was swapped."""
+    parent = os.path.dirname(target_real)
+    temporary = None
+    try:
+        for _ in range(32):
+            candidate = os.path.join(parent, ".handoff-seam-" + secrets.token_hex(8))
+            try:
+                descriptor = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                )
+                temporary = candidate
+                break
+            except FileExistsError:
+                continue
+        if temporary is None:
+            raise SeamError("could not create a temporary file next to %s" % target_real)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, stat.S_IMODE(target_lstat.st_mode))
+        latest = os.lstat(target_real)
+        if (latest.st_dev, latest.st_ino) != (target_lstat.st_dev, target_lstat.st_ino):
+            raise SeamError("handoff file changed during sealing; aborted")
+        os.replace(temporary, target_real)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def seal_file(handoff_path, session_id):
+    if not SESSION_ID_RE.match(session_id):
+        raise SeamError("invalid --session-id (letters, digits, '.', '_', '-' only)")
+
+    text, metadata = read_handoff(handoff_path)
+    lines = text.splitlines()
+    stripped = [line.strip() for line in lines]
+    if MARKER_OPEN in stripped or MARKER_CLOSE in stripped or RESUME_HEADING in stripped:
+        raise SeamError(
+            "%s already contains a seam block or resume section; "
+            "seal operates on unsealed prose only" % handoff_path
+        )
+
+    actual = os.path.realpath(handoff_path)
+    anchor = os.path.dirname(actual)
+    probe = capture_seam(anchor, [])
+    root = probe["worktree_root"]
+    exclusions = exclusions_for(root, actual)
+    core = capture_seam(anchor, exclusions)
+
+    seam = dict(core)
+    seam["handoff_path"] = actual
+    seam["schema_version"] = SCHEMA_VERSION
+    seam["session_id"] = session_id
+    manifest = json.dumps(seam, separators=(",", ":"), sort_keys=True)
+
+    insert_at = 1 if lines and lines[0].startswith("#") else 0
+    reentry = "cd %s && handoff-seam read %s" % (shlex.quote(root), shlex.quote(actual))
+    sealed_lines = (
+        lines[:insert_at]
+        + [MARKER_OPEN, manifest, MARKER_CLOSE]
+        + lines[insert_at:]
+        + [
+            "",
+            RESUME_HEADING,
+            "",
+            "Machine-checked binding to the exact git state below. "
+            "Verify before trusting the prose above.",
+            "",
+            "- Worktree: `%s`" % root,
+            "- Branch: `%s`" % _describe(seam["branch_ref"]),
+            "- HEAD: `%s`" % seam["head_oid"],
+            "- Dirty: `%s`" % _describe(seam["dirty"]),
+            "",
+            "**Re-entry one-liner**",
+            "",
+            "```bash",
+            reentry,
+            "```",
+        ]
+    )
+    encoded = ("\n".join(sealed_lines) + "\n").encode("utf-8")
+    if len(encoded) > MAX_HANDOFF_BYTES:
+        raise SeamError("sealed handoff would exceed the %dB cap" % MAX_HANDOFF_BYTES)
+
+    atomic_replace(actual, metadata, encoded, stat.S_IMODE(metadata.st_mode))
+
+    # Immediate re-verification: sealing must not have disturbed its own seam.
+    verify_file(actual, root)
+    return seam, reentry
+
+
+def print_summary(prefix, seam, stream):
+    print(
+        "%s %s @ %s (%s, dirty=%s)"
+        % (
+            prefix,
+            seam["worktree_root"],
+            seam["head_oid"][:12],
+            _describe(seam["branch_ref"]),
+            _describe(seam["dirty"]),
+        ),
+        file=stream,
+    )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="handoff-seam",
+        description=__doc__.splitlines()[0],
+        epilog="Exit codes: 0 seam matches; 1 state drift; 2 structural/usage failure.",
+    )
+    parser.add_argument("--version", action="version", version="handoff-seam %s" % VERSION)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    capture_cmd = commands.add_parser("capture", help="print the current seam JSON")
+    capture_cmd.add_argument(
+        "--repo", default=".", help="any directory inside the worktree (default: cwd)"
+    )
+
+    seal_cmd = commands.add_parser("seal", help="seal FILE to the current git state")
+    seal_cmd.add_argument("file")
+    seal_cmd.add_argument("--session-id", default="manual")
+
+    for name, help_text in (
+        ("verify", "recompute the seam and compare against FILE's seal"),
+        ("read", "verify, then print FILE only if the seam matches"),
+    ):
+        sub = commands.add_parser(name, help=help_text)
+        sub.add_argument("file")
+        sub.add_argument(
+            "--repo", default=".", help="any directory inside the worktree (default: cwd)"
+        )
+        sub.add_argument(
+            "--session-id",
+            default=None,
+            help="additionally require the sealed session_id to equal this value",
+        )
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "capture":
+            seam = capture_seam(args.repo, [])
+            seam["schema_version"] = SCHEMA_VERSION
+            print(json.dumps(seam, separators=(",", ":"), sort_keys=True))
+        elif args.command == "seal":
+            seam, reentry = seal_file(args.file, args.session_id)
+            print_summary("handoff-seam: sealed", seam, sys.stderr)
+            print(reentry)
+        elif args.command == "verify":
+            seam, _text = verify_file(args.file, args.repo, args.session_id)
+            print_summary("handoff-seam: verified", seam, sys.stderr)
+        elif args.command == "read":
+            seam, text = verify_file(args.file, args.repo, args.session_id)
+            print_summary("handoff-seam: verified", seam, sys.stderr)
+            sys.stdout.write(text)
+            if text and not text.endswith("\n"):
+                sys.stdout.write("\n")
+    except SeamMismatch as mismatch:
+        print(
+            "handoff-seam: REJECTED — the git state no longer matches the seal:",
+            file=sys.stderr,
+        )
+        for key, sealed, current in mismatch.diffs:
+            print(
+                "  %-16s sealed=%s  current=%s"
+                % (key, _describe(sealed), _describe(current)),
+                file=sys.stderr,
+            )
+        print(
+            "handoff-seam: do not trust the prose; re-establish the sealed state "
+            "or write a fresh handoff.",
+            file=sys.stderr,
+        )
+        return 1
+    except SeamError as error:
+        print("handoff-seam: error: %s" % error, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

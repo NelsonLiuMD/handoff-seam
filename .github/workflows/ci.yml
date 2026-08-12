@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain versions
+        run: |
+          git --version
+          python3 --version
+          bash --version | head -1
+
+      - name: Syntax-check shell scripts
+        run: bash -n install.sh uninstall.sh tests/run.sh demo/wrong-worktree.sh hooks/verify-latest.sh
+
+      - name: Shellcheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then brew install shellcheck; fi
+          shellcheck install.sh uninstall.sh tests/run.sh demo/wrong-worktree.sh hooks/verify-latest.sh
+
+      - name: Unit and adversarial tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Demo — wrong-worktree rejection
+        run: demo/wrong-worktree.sh
+
+      - name: Install / uninstall idempotency cycle
+        run: |
+          PREFIX="$RUNNER_TEMP/prefix" ./install.sh
+          PREFIX="$RUNNER_TEMP/prefix" ./install.sh
+          "$RUNNER_TEMP/prefix/bin/handoff-seam" --version
+          PREFIX="$RUNNER_TEMP/prefix" ./uninstall.sh
+          PREFIX="$RUNNER_TEMP/prefix" ./uninstall.sh
+          test ! -e "$RUNNER_TEMP/prefix/bin/handoff-seam"
