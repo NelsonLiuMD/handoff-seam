@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # GitHub Actions are the repository's only third-party dependency: the CLI is
+  # Python standard library only and the shell adapters call nothing but git.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
