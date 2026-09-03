@@ -19,14 +19,29 @@
 
 * A seam whose `schema_version` is not `1` is now refused with
   `unsupported seam schema_version N (this build supports 1); upgrade handoff-seam`
-  (exit 2, and in `--json` reasons). The version is checked before the key-set
-  check, so a seam from a future build reports the skew instead of looking
-  malformed.
+  (exit 2, and in `--json` reasons). The key-set check still runs first, so a
+  manifest this build cannot fully validate stays a structural refusal.
+* A `--session-id` mismatch reports `code: "session_id"` rather than
+  `code: "drift"`, because its `current` holds the value the caller required,
+  not captured repository state.
 * The `SessionStart` hook reads its verdict through `verify --json` and renders
   the drifted fields as a list. Same verdict semantics, same silence about the
   prose.
 * CI: `actions/checkout` pinned to a full commit SHA, plus job `timeout-minutes`
   and `concurrency` cancellation.
+
+### Fixed
+
+* Refusal messages no longer quote a value out of the handoff manifest. A
+  `schema_version` is rendered as a decimal of at most 20 characters or as the
+  fixed token `non-integer` / `out-of-range`, so a hostile file cannot push
+  arbitrary text through a diagnosis into an agent's context by way of the
+  `SessionStart` hook.
+* An unreadable or missing path is now a structural refusal (exit 2) with a
+  one-line message, in both output modes. It previously escaped `main` as an
+  `OSError` traceback and exited 1, the drift code, breaking the `--json`
+  guarantees on a case that is not drift at all. Any unexpected exception is
+  likewise reported as exit 2 naming only the exception class.
 
 ## 0.1.0 — 2026-08-11
 

@@ -25,7 +25,8 @@ Exit codes:
     0   seam matches
     1   state drift (one or more seam fields no longer match)
     2   structural or usage failure (missing/malformed seam, moved file,
-        size cap exceeded, not a git worktree, unborn HEAD, bad arguments)
+        size cap exceeded, unreadable path, not a git worktree, unborn HEAD,
+        bad arguments)
 
 Requires: git, python3 >= 3.8. Never mutates the repository (git runs with
 GIT_OPTIONAL_LOCKS=0). Never invokes a model, never reads transcripts.
@@ -85,9 +86,6 @@ CORE_KEYS = (
 )
 
 
-_MISSING = object()
-
-
 def _is_supported_version(value):
     """True only for the exact integer this build understands (bool is not one)."""
     if isinstance(value, bool) or not isinstance(value, int):
@@ -96,10 +94,18 @@ def _is_supported_version(value):
 
 
 def _render_version(value):
-    """Show a plain integer bare; anything else quoted, so junk is unambiguous."""
-    if isinstance(value, int) and not isinstance(value, bool):
-        return str(value)
-    return repr(value)
+    """Name a seam's schema_version in a diagnosis, without echoing the file.
+
+    A handoff manifest is untrusted input and this diagnosis can reach an
+    agent's context through the SessionStart hook, so the result is always one
+    of three bounded shapes: a decimal of at most 20 characters, or one of the
+    fixed tokens below. No byte of an attacker-chosen value is ever echoed.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "non-integer"
+    if value < 0 or value.bit_length() > 64:  # 2**64 - 1 is 20 digits
+        return "out-of-range"
+    return str(value)
 
 
 class SeamError(Exception):
@@ -425,18 +431,17 @@ def parse_seam(text, path):
         seam = json.loads(lines[start + 1])
     except ValueError:
         raise SeamError("seam manifest in %s is not valid JSON" % path)
-    # The version gate runs before the key-set check so that a seam written by
-    # a newer build — which may legitimately carry keys this build never heard
-    # of — is diagnosed as a version skew, not as a malformed manifest.
-    if isinstance(seam, dict):
-        version = seam.get("schema_version", _MISSING)
-        if version is not _MISSING and not _is_supported_version(version):
-            raise SeamError(
-                "unsupported seam schema_version %s (this build supports %d); "
-                "upgrade handoff-seam" % (_render_version(version), SCHEMA_VERSION)
-            )
     if not isinstance(seam, dict) or set(seam) != EXPECTED_KEYS:
         raise SeamError("seam manifest in %s has an unexpected key set" % path)
+    # The version gate runs after the key-set check, so a manifest this build
+    # cannot fully validate is refused structurally and its contents are never
+    # quoted back. The gate speaks only for otherwise well-formed v1 key sets.
+    if not _is_supported_version(seam["schema_version"]):
+        raise SeamError(
+            "unsupported seam schema_version %s (this build supports %d); "
+            "upgrade handoff-seam"
+            % (_render_version(seam["schema_version"]), SCHEMA_VERSION)
+        )
     if not isinstance(seam["dirty"], bool):
         raise SeamError("seam field 'dirty' must be a boolean in %s" % path)
     if seam["branch_ref"] is not None and not (
@@ -508,9 +513,18 @@ def _now_iso8601():
     return stamp.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def _reason_code(field):
+    """session_id is a caller-supplied expectation, not captured repo state.
+
+    It gets its own code so a consumer never reads `current` on a drift entry
+    as "what the repository looks like now".
+    """
+    return "session_id" if field == "session_id" else "drift"
+
+
 def drift_reason(key, sealed, current):
     return {
-        "code": "drift",
+        "code": _reason_code(key),
         "field": key,
         "sealed": sealed,
         "current": current,
@@ -547,6 +561,15 @@ def emit_report(verified, exit_code, reasons, seam, content=None):
         report["content"] = content
     json.dump(report, sys.stdout)
     sys.stdout.write("\n")
+
+
+def _fail_structurally(message, as_json):
+    """Report a structural refusal on the requested surface. Always exit 2."""
+    if as_json:
+        emit_report(False, 2, [structural_reason(message)], None)
+    else:
+        print("handoff-seam: error: %s" % message, file=sys.stderr)
+    return 2
 
 
 def atomic_replace(target_real, target_lstat, encoded, mode):
@@ -754,11 +777,19 @@ def main(argv=None):
         )
         return 1
     except SeamError as error:
-        if as_json:
-            emit_report(False, 2, [structural_reason(str(error))], None)
-            return 2
-        print("handoff-seam: error: %s" % error, file=sys.stderr)
-        return 2
+        return _fail_structurally(str(error), as_json)
+    except OSError as error:
+        # A missing or unreadable path must not escape as a traceback: that
+        # would break the --json contract and return the drift code for what
+        # is a structural failure. strerror is the C library's own text.
+        target = getattr(args, "file", None) or getattr(args, "repo", "")
+        detail = error.strerror or error.__class__.__name__
+        return _fail_structurally("cannot access %s: %s" % (target, detail), as_json)
+    except Exception as error:  # last resort: a class name, never a traceback
+        return _fail_structurally(
+            "internal error (%s); please report this" % error.__class__.__name__,
+            as_json,
+        )
     return 0
 
 

@@ -86,10 +86,18 @@ $ handoff-seam verify --json .claude/handoff-2026-08-11-migration.md
 | --- | --- |
 | `verified` | `true` only when every seam field matched |
 | `exit_code` | The process exit code — `0`, `1`, or `2`, same as without the flag |
-| `reasons` | Empty on a pass. Otherwise one entry per refusal, every entry carrying the same keys: `code` (`drift` or `structural`), `field` (the seam field, or `null`), `sealed`, `current`, and a human-readable `message` |
-| `seam` | The sealed manifest, or `null` when the file could not be parsed at all |
+| `reasons` | Empty on a pass. Otherwise one entry per refusal, every entry carrying the same keys: `code`, `field` (the seam field, or `null`), `sealed`, `current`, and a human-readable `message` |
+| `seam` | The sealed manifest on a pass or a drift refusal. `null` for **every** structural refusal (exit 2) — including ones where the manifest itself parsed cleanly, such as a moved file |
 | `checked_at` | When the check ran (UTC, ISO 8601). It is **not** a sealed field — the seam carries no timestamp by design |
 | `content` | `read --json` only, and **only when `verified` is `true`**. A rejection has no `content` key at all |
+
+A reason's `code` is one of:
+
+| `code` | Meaning |
+| --- | --- |
+| `drift` | The seam field named in `field` no longer matches the repository. `sealed` is what was recorded, `current` what was just captured. Exit 1 |
+| `session_id` | The `--session-id` you required does not match the seal. `sealed` is the recorded id and `current` is **the value you asked for** — a caller expectation, not captured state, which is why it is not a `drift` entry. Exit 1 |
+| `structural` | The file or its manifest could not be trusted enough to compare: no seam block, malformed manifest, unknown key set, unsupported `schema_version`, moved or copied file, size cap exceeded, unreadable path. `field` is `null`. Exit 2 |
 
 Gating a resume from a shell script (`jq` used for brevity; the object is
 plain JSON, so any parser will do):
