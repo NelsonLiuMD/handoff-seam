@@ -60,8 +60,8 @@ handoff-seam: do not trust the prose; re-establish the sealed state or write a f
 | --- | --- |
 | `capture [--repo DIR]` | Print the current seam JSON for the worktree containing `DIR` (default: cwd) |
 | `seal FILE [--session-id ID]` | Bind `FILE` (in place, atomic) to the current git state, then immediately re-verify |
-| `verify FILE [--repo DIR] [--session-id ID]` | Recompute and compare; diagnosis on stderr |
-| `read FILE [--repo DIR] [--session-id ID]` | `verify`, then print `FILE` to stdout only on a match |
+| `verify FILE [--repo DIR] [--session-id ID] [--json]` | Recompute and compare; diagnosis on stderr |
+| `read FILE [--repo DIR] [--session-id ID] [--json]` | `verify`, then print `FILE` to stdout only on a match |
 
 Exit codes: **0** seam matches · **1** state drift (any field mismatch) ·
 **2** structural failure (missing/malformed seam, moved or copied file, size
@@ -70,6 +70,39 @@ cap exceeded, not a git worktree, unborn HEAD, bad usage).
 A moved or copied handoff file is a structural failure (exit 2), not drift:
 the sealed `handoff_path` must equal the file's current `realpath`, so a
 handoff cannot be transplanted into another repository and verified there.
+
+### Scripting: `--json`
+
+`verify` and `read` accept `--json`. Stdout becomes exactly one JSON object,
+stderr stays empty, and the exit codes are unchanged — branch on whichever
+suits your caller.
+
+```console
+$ handoff-seam verify --json .claude/handoff-2026-08-11-migration.md
+{"verified": true, "exit_code": 0, "reasons": [], "seam": {…}, "checked_at": "2026-08-12T09:14:03Z"}
+```
+
+| Key | Value |
+| --- | --- |
+| `verified` | `true` only when every seam field matched |
+| `exit_code` | The process exit code — `0`, `1`, or `2`, same as without the flag |
+| `reasons` | Empty on a pass. Otherwise one entry per refusal, every entry carrying the same keys: `code` (`drift` or `structural`), `field` (the seam field, or `null`), `sealed`, `current`, and a human-readable `message` |
+| `seam` | The sealed manifest, or `null` when the file could not be parsed at all |
+| `checked_at` | When the check ran (UTC, ISO 8601). It is **not** a sealed field — the seam carries no timestamp by design |
+| `content` | `read --json` only, and **only when `verified` is `true`**. A rejection has no `content` key at all |
+
+Gating a resume from a shell script (`jq` used for brevity; the object is
+plain JSON, so any parser will do):
+
+```bash
+if report=$(handoff-seam read --json "$handoff"); then
+  jq -r '.content' <<<"$report" > resume-notes.md
+else
+  echo "refusing to resume:" >&2
+  jq -r '.reasons[].message' <<<"$report" >&2
+  exit 1
+fi
+```
 
 ## Demo: same commit, wrong worktree, rejected
 
@@ -105,7 +138,7 @@ invisible in rendered Markdown:
 | `status_sha256` | SHA-256 over `status --porcelain=v2 -z`, `diff --binary HEAD`, and each untracked file's mode + content (symlink targets and special files included as markers) |
 | `handoff_path` | `realpath` of the sealed file itself |
 | `session_id` | Free-form tag (`--session-id`), compared only when requested at verify time |
-| `schema_version` | `1` |
+| `schema_version` | `1`. A seam written by a future build is refused (exit 2) with a message naming the version this build supports, rather than a generic parse failure |
 
 **Exclusions:** the sealed file itself, sibling `handoff-*.md` files in the
 same directory, and `.handoff-seam-*` temp files are excluded from the
@@ -128,9 +161,10 @@ claude --plugin-dir /path/to/handoff-seam
 * `/handoff-seam:verify` — gate-read a sealed handoff; instructs the agent to
   **stop** rather than read the file by other means when verification fails.
 * A `SessionStart` hook checks the newest sealed `.claude/handoff-*.md` in the
-  session's repository and injects a one-line VERIFIED/REJECTED verdict as
-  context — never the prose. Sessions in repositories with no sealed handoff
-  are untouched.
+  session's repository and injects a VERIFIED/REJECTED verdict as context —
+  on a rejection, the drifted seam fields; never the prose. It reads the
+  verdict through `verify --json`. Sessions in repositories with no sealed
+  handoff are untouched.
 
 The plugin requires no model invocation and reads no transcripts. Everything
 is local git inspection.

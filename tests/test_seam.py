@@ -14,6 +14,7 @@ import tempfile
 import unittest
 
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin" / "handoff-seam"
+HOOK = pathlib.Path(__file__).resolve().parent.parent / "hooks" / "verify-latest.sh"
 MARKER_OPEN = "<!-- handoff-seam-v1 -->"
 
 
@@ -78,6 +79,23 @@ class SeamTestCase(unittest.TestCase):
         if needle is not None:
             self.assertIn(needle, result.stderr)
         return result
+
+    def json_cli(self, *args, cwd, code):
+        """Run a --json invocation and assert the contract every report obeys."""
+        result = self.cli(*(list(args) + ["--json"]), cwd=cwd)
+        self.assertEqual(result.returncode, code, msg=result.stderr)
+        self.assertEqual(result.stderr, "", msg="--json must leave stderr empty")
+        report = json.loads(result.stdout)
+        self.assertEqual(report["exit_code"], code)
+        self.assertIs(report["verified"], code == 0)
+        self.assertRegex(
+            report["checked_at"], r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z"
+        )
+        for reason in report["reasons"]:
+            self.assertEqual(
+                set(reason), {"code", "field", "sealed", "current", "message"}
+            )
+        return report
 
     # ------------------------------------------------------------------ happy paths
 
@@ -351,6 +369,130 @@ class SeamTestCase(unittest.TestCase):
         self.assert_verify(repo, handoff, 0)
         seam = json.loads(self.cli("capture", cwd=repo).stdout)
         self.assertEqual(len(seam["head_oid"]), 64)
+
+
+    # ------------------------------------------------------------------ json output
+
+    def test_verify_json_reports_a_verified_seam(self):
+        repo = self.make_repo()
+        handoff = self.write_handoff(repo)
+        self.seal(handoff)
+        report = self.json_cli("verify", str(handoff), cwd=repo, code=0)
+        self.assertEqual(report["reasons"], [])
+        self.assertNotIn("content", report)
+        self.assertEqual(report["seam"]["worktree_root"], os.path.realpath(repo))
+        self.assertEqual(report["seam"]["schema_version"], 1)
+
+    def test_verify_json_reports_drift_field_by_field(self):
+        repo = self.make_repo()
+        handoff = self.write_handoff(repo)
+        self.seal(handoff)
+        (repo / "surprise.txt").write_text("drift\n")
+        report = self.json_cli("verify", str(handoff), cwd=repo, code=1)
+        self.assertEqual({reason["code"] for reason in report["reasons"]}, {"drift"})
+        self.assertIn("status_sha256", [reason["field"] for reason in report["reasons"]])
+        # The sealed seam still rides along, so a caller can say what was expected.
+        head = self.git(repo, "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(report["seam"]["head_oid"], head)
+        self.assertNotIn("content", report)
+
+    def test_verify_json_reports_structural_failure_on_unsealed_file(self):
+        repo = self.make_repo()
+        handoff = self.write_handoff(repo)
+        report = self.json_cli("verify", str(handoff), cwd=repo, code=2)
+        self.assertIsNone(report["seam"])
+        self.assertEqual(len(report["reasons"]), 1)
+        self.assertEqual(report["reasons"][0]["code"], "structural")
+        self.assertIsNone(report["reasons"][0]["field"])
+        self.assertIn("no seam block", report["reasons"][0]["message"])
+
+    def test_read_json_carries_prose_when_verified(self):
+        repo = self.make_repo()
+        handoff = self.write_handoff(repo)
+        self.seal(handoff)
+        report = self.json_cli("read", str(handoff), cwd=repo, code=0)
+        self.assertEqual(report["reasons"], [])
+        self.assertIn("plan: alpha", report["content"])
+
+    def test_read_json_withholds_prose_when_rejected(self):
+        repo = self.make_repo()
+        handoff = self.write_handoff(repo)
+        self.seal(handoff)
+        (repo / "drift.txt").write_text("drift\n")
+        result = self.cli("read", str(handoff), "--json", cwd=repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("plan: alpha", result.stdout)
+        self.assertNotIn("plan: alpha", result.stderr)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["verified"])
+        self.assertNotIn("content", report)
+
+    def test_unsupported_schema_version_names_the_upgrade(self):
+        repo = self.make_repo()
+        handoff = self.write_handoff(repo)
+        self.seal(handoff)
+        lines = handoff.read_text().splitlines()
+        index = lines.index(MARKER_OPEN) + 1
+        seam = json.loads(lines[index])
+        seam["schema_version"] = 2
+        # A newer build may also carry keys this one has never seen; the version
+        # skew must be diagnosed ahead of the key-set check, not as a malformed
+        # manifest.
+        seam["future_field"] = "written by a newer build"
+        lines[index] = json.dumps(seam, separators=(",", ":"), sort_keys=True)
+        handoff.write_text("\n".join(lines) + "\n")
+        expected = (
+            "unsupported seam schema_version 2 (this build supports 1); "
+            "upgrade handoff-seam"
+        )
+        self.assert_verify(repo, handoff, 2, expected)
+        report = self.json_cli("verify", str(handoff), cwd=repo, code=2)
+        self.assertEqual(report["reasons"][0]["message"], expected)
+
+
+    # ------------------------------------------------------------------ SessionStart hook
+
+    def run_hook(self, repo):
+        env = dict(self.env)
+        env["CLAUDE_PLUGIN_ROOT"] = str(BIN.parent.parent)
+        return subprocess.run(
+            ["bash", str(HOOK)],
+            input=json.dumps({"cwd": str(repo)}),
+            cwd=str(repo),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def hook_context(self, repo):
+        result = self.run_hook(repo)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        return json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+
+    def seal_in_claude_dir(self, repo):
+        directory = repo / ".claude"
+        directory.mkdir()
+        handoff = self.write_handoff(directory)
+        self.seal(handoff)
+        return handoff
+
+    def test_hook_surfaces_a_verified_verdict(self):
+        repo = self.make_repo()
+        self.seal_in_claude_dir(repo)
+        context = self.hook_context(repo)
+        self.assertIn("VERIFIED", context)
+        self.assertNotIn("plan: alpha", context)
+
+    def test_hook_surfaces_drift_reasons_and_never_the_prose(self):
+        repo = self.make_repo()
+        self.seal_in_claude_dir(repo)
+        (repo / "surprise.txt").write_text("drift\n")
+        context = self.hook_context(repo)
+        self.assertIn("FAILED seam verification", context)
+        # Rendered from --json reasons, not a raw dump of the report.
+        self.assertIn("- status_sha256: sealed=", context)
+        self.assertNotIn('"reasons"', context)
+        self.assertNotIn("plan: alpha", context)
 
 
 if __name__ == "__main__":

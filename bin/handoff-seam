@@ -15,6 +15,12 @@ Subcommands:
     verify FILE         Recompute the seam and compare against FILE's seal.
     read FILE           Verify, then print FILE only if the seam matches.
 
+`verify` and `read` also accept --json, for callers that script this tool:
+stdout becomes exactly one JSON object (verdict, exit code, machine-readable
+reasons, the sealed seam, and the time of the check) and stderr stays empty.
+`read --json` carries the file content in "content", and only when the seam
+matches. Exit codes are identical with and without the flag.
+
 Exit codes:
     0   seam matches
     1   state drift (one or more seam fields no longer match)
@@ -26,6 +32,7 @@ GIT_OPTIONAL_LOCKS=0). Never invokes a model, never reads transcripts.
 """
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -78,6 +85,23 @@ CORE_KEYS = (
 )
 
 
+_MISSING = object()
+
+
+def _is_supported_version(value):
+    """True only for the exact integer this build understands (bool is not one)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    return value == SCHEMA_VERSION
+
+
+def _render_version(value):
+    """Show a plain integer bare; anything else quoted, so junk is unambiguous."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return repr(value)
+
+
 class SeamError(Exception):
     """Structural or usage failure. Exit 2."""
 
@@ -85,8 +109,9 @@ class SeamError(Exception):
 class SeamMismatch(Exception):
     """The sealed seam no longer matches reality. Exit 1."""
 
-    def __init__(self, diffs):
+    def __init__(self, diffs, seam=None):
         self.diffs = diffs
+        self.seam = seam
         super().__init__("seam mismatch")
 
 
@@ -400,12 +425,18 @@ def parse_seam(text, path):
         seam = json.loads(lines[start + 1])
     except ValueError:
         raise SeamError("seam manifest in %s is not valid JSON" % path)
+    # The version gate runs before the key-set check so that a seam written by
+    # a newer build — which may legitimately carry keys this build never heard
+    # of — is diagnosed as a version skew, not as a malformed manifest.
+    if isinstance(seam, dict):
+        version = seam.get("schema_version", _MISSING)
+        if version is not _MISSING and not _is_supported_version(version):
+            raise SeamError(
+                "unsupported seam schema_version %s (this build supports %d); "
+                "upgrade handoff-seam" % (_render_version(version), SCHEMA_VERSION)
+            )
     if not isinstance(seam, dict) or set(seam) != EXPECTED_KEYS:
         raise SeamError("seam manifest in %s has an unexpected key set" % path)
-    if seam["schema_version"] != SCHEMA_VERSION:
-        raise SeamError(
-            "unsupported seam schema_version %r in %s" % (seam["schema_version"], path)
-        )
     if not isinstance(seam["dirty"], bool):
         raise SeamError("seam field 'dirty' must be a boolean in %s" % path)
     if seam["branch_ref"] is not None and not (
@@ -457,7 +488,7 @@ def verify_file(handoff_path, anchor_dir, expected_session_id=None):
         if seam[key] != current[key]:
             diffs.append((key, seam[key], current[key]))
     if diffs:
-        raise SeamMismatch(diffs)
+        raise SeamMismatch(diffs, seam)
     return seam, text
 
 
@@ -469,6 +500,53 @@ def _describe(value):
     if value is False:
         return "false"
     return str(value)
+
+
+def _now_iso8601():
+    """UTC instant the check ran, e.g. 2026-09-03T18:04:05Z."""
+    stamp = datetime.datetime.now(datetime.timezone.utc)
+    return stamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def drift_reason(key, sealed, current):
+    return {
+        "code": "drift",
+        "field": key,
+        "sealed": sealed,
+        "current": current,
+        "message": "%s: sealed=%s current=%s"
+        % (key, _describe(sealed), _describe(current)),
+    }
+
+
+def structural_reason(message):
+    """A refusal with no single responsible seam field (parse, path, cap, usage)."""
+    return {
+        "code": "structural",
+        "field": None,
+        "sealed": None,
+        "current": None,
+        "message": message,
+    }
+
+
+def emit_report(verified, exit_code, reasons, seam, content=None):
+    """Write the one-object machine report to stdout. Never touches stderr.
+
+    Every entry in "reasons" has the same keys, so a consumer can always read
+    `.reasons[].message` and filter structured cases on `.code`.
+    """
+    report = {
+        "verified": verified,
+        "exit_code": exit_code,
+        "reasons": reasons,
+        "seam": seam,
+        "checked_at": _now_iso8601(),
+    }
+    if content is not None:
+        report["content"] = content
+    json.dump(report, sys.stdout)
+    sys.stdout.write("\n")
 
 
 def atomic_replace(target_real, target_lstat, encoded, mode):
@@ -616,8 +694,15 @@ def main(argv=None):
             default=None,
             help="additionally require the sealed session_id to equal this value",
         )
+        sub.add_argument(
+            "--json",
+            action="store_true",
+            help="print one JSON object on stdout (stderr stays empty); "
+            "exit codes are unchanged",
+        )
 
     args = parser.parse_args(argv)
+    as_json = getattr(args, "json", False)
     try:
         if args.command == "capture":
             seam = capture_seam(args.repo, [])
@@ -629,14 +714,29 @@ def main(argv=None):
             print(reentry)
         elif args.command == "verify":
             seam, _text = verify_file(args.file, args.repo, args.session_id)
-            print_summary("handoff-seam: verified", seam, sys.stderr)
+            if as_json:
+                emit_report(True, 0, [], seam)
+            else:
+                print_summary("handoff-seam: verified", seam, sys.stderr)
         elif args.command == "read":
             seam, text = verify_file(args.file, args.repo, args.session_id)
-            print_summary("handoff-seam: verified", seam, sys.stderr)
-            sys.stdout.write(text)
-            if text and not text.endswith("\n"):
-                sys.stdout.write("\n")
+            if as_json:
+                emit_report(True, 0, [], seam, content=text)
+            else:
+                print_summary("handoff-seam: verified", seam, sys.stderr)
+                sys.stdout.write(text)
+                if text and not text.endswith("\n"):
+                    sys.stdout.write("\n")
     except SeamMismatch as mismatch:
+        if as_json:
+            # No "content" key on a rejection: the prose never leaves the file.
+            emit_report(
+                False,
+                1,
+                [drift_reason(*diff) for diff in mismatch.diffs],
+                mismatch.seam,
+            )
+            return 1
         print(
             "handoff-seam: REJECTED — the git state no longer matches the seal:",
             file=sys.stderr,
@@ -654,6 +754,9 @@ def main(argv=None):
         )
         return 1
     except SeamError as error:
+        if as_json:
+            emit_report(False, 2, [structural_reason(str(error))], None)
+            return 2
         print("handoff-seam: error: %s" % error, file=sys.stderr)
         return 2
     return 0
