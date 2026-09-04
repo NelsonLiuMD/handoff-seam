@@ -60,6 +60,25 @@ DEADLINE_SECONDS = 30.0
 OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+BRANCH_REF_RE = re.compile(r"refs/[A-Za-z0-9._/+-]{1,255}\Z")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+# Bounds on the manifest's string fields. A handoff file is untrusted input and
+# every refusal message can reach an agent's context through the SessionStart
+# hook, so a field that breaks one of these is refused structurally by name and
+# rule — its value is never quoted back.
+MAX_PATH_BYTES = 4096
+MAX_REF_CHARS = 255  # characters after the mandatory "refs/" prefix
+MAX_RENDER_CHARS = 200  # hard ceiling on any rendered manifest value
+INVALID_TOKEN = "<invalid>"
+DETACHED_TOKEN = "(detached)"
+
+PATH_KEYS = (
+    "git_common_dir",
+    "handoff_path",
+    "worktree_git_dir",
+    "worktree_root",
+)
 
 EXPECTED_KEYS = {
     "branch_ref",
@@ -106,6 +125,80 @@ def _render_version(value):
     if value < 0 or value.bit_length() > 64:  # 2**64 - 1 is 20 digits
         return "out-of-range"
     return str(value)
+
+
+def path_rule_broken(value):
+    """Name the rule an absolute-path field breaks, or None when it is sound.
+
+    The returned string names the *rule*, never the value: it is safe to put in
+    a refusal message even though the value it describes is attacker-chosen.
+    """
+    if not isinstance(value, str) or not value:
+        return "must be a non-empty string"
+    if len(value.encode("utf-8", errors="surrogatepass")) > MAX_PATH_BYTES:
+        return "exceeds %d bytes" % MAX_PATH_BYTES
+    if CONTROL_RE.search(value):
+        return "contains a control character"
+    if not os.path.isabs(value):
+        return "not an absolute path"
+    return None
+
+
+def branch_ref_rule_broken(value):
+    """Name the rule branch_ref breaks, or None. `None` is the detached marker."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        return "must be null or a refs/ path"
+    if not value.startswith("refs/"):
+        return "not a refs/ path"
+    if len(value) - len("refs/") > MAX_REF_CHARS:
+        return "exceeds %d characters after 'refs/'" % MAX_REF_CHARS
+    if not BRANCH_REF_RE.match(value):
+        return "contains a character outside [A-Za-z0-9._/+-]"
+    return None
+
+
+def _truncate(value):
+    """Cap a rendered value at MAX_RENDER_CHARS characters, ellipsis included."""
+    if len(value) <= MAX_RENDER_CHARS:
+        return value
+    return value[: MAX_RENDER_CHARS - 3] + "..."
+
+
+def _render_field(name, value):
+    """Render one seam field for a human message or a --json reason.
+
+    Every seam value that reaches a message goes through here. A value that
+    passes its field's validation is emitted, truncated to MAX_RENDER_CHARS;
+    anything else becomes the fixed token `<invalid>`. So a diagnosis can never
+    carry more than a bounded, validated token out of an untrusted manifest —
+    not even when the manifest was rejected precisely because a field was bad.
+    """
+    if name == "branch_ref":
+        if value is None:
+            return DETACHED_TOKEN
+        return INVALID_TOKEN if branch_ref_rule_broken(value) else _truncate(value)
+    if name == "dirty":
+        if value is True:
+            return "true"
+        if value is False:
+            return "false"
+        return INVALID_TOKEN
+    if name == "schema_version":
+        return _render_version(value)
+    if name in PATH_KEYS:
+        return INVALID_TOKEN if path_rule_broken(value) else _truncate(value)
+    pattern = {
+        "head_oid": OID_RE,
+        "session_id": SESSION_ID_RE,
+        "status_sha256": SHA256_RE,
+    }.get(name)
+    if pattern is not None:
+        if isinstance(value, str) and pattern.match(value):
+            return value
+        return INVALID_TOKEN
+    return INVALID_TOKEN
 
 
 class SeamError(Exception):
@@ -238,8 +331,15 @@ def capture_seam(anchor_dir, exclusions):
         branch_ref = _single_line(
             branch.stdout.decode("utf-8", errors="strict"), "branch ref"
         )
-        if not branch_ref.startswith("refs/"):
-            raise SeamError("unexpected symbolic ref: %r" % branch_ref)
+        broken = branch_ref_rule_broken(branch_ref)
+        if broken:
+            # Refuse at capture time so `seal` never writes a manifest that
+            # `verify` would later refuse structurally. The rule is named; the
+            # ref itself is rendered only within the bounded token budget.
+            raise SeamError(
+                "checked-out ref cannot be sealed (branch_ref: %s): %s"
+                % (broken, _truncate(branch_ref))
+            )
     elif branch.returncode == 1:
         branch_ref = None
     else:
@@ -346,7 +446,7 @@ def capture_seam(anchor_dir, exclusions):
         else:
             fingerprint.update(b"special\0")
 
-    return {
+    captured = {
         "branch_ref": branch_ref,
         "dirty": bool(status_bytes),
         "git_common_dir": git_common_dir,
@@ -355,6 +455,19 @@ def capture_seam(anchor_dir, exclusions):
         "worktree_git_dir": worktree_git_dir,
         "worktree_root": root,
     }
+    # Same bounds parse_seam enforces on a sealed manifest, applied to what we
+    # are about to seal: capture and parse accept exactly the same shapes, so a
+    # successful `seal` can never produce a file `verify` refuses structurally.
+    for key in PATH_KEYS:
+        if key not in captured:
+            continue
+        broken = path_rule_broken(captured[key])
+        if broken:
+            raise SeamError(
+                "captured %s cannot be sealed (%s): %s"
+                % (key, broken, _truncate(str(captured[key])))
+            )
+    return captured
 
 
 def exclusions_for(worktree_root, handoff_real):
@@ -367,8 +480,14 @@ def exclusions_for(worktree_root, handoff_real):
     """
     relative = os.path.relpath(handoff_real, worktree_root)
     if relative.startswith(".."):
+        # worktree_root can come straight out of an untrusted manifest, so both
+        # sides go through the bounded renderer.
         raise SeamError(
-            "handoff file %s is not inside worktree %s" % (handoff_real, worktree_root)
+            "handoff file %s is not inside worktree %s"
+            % (
+                _render_field("handoff_path", handoff_real),
+                _render_field("worktree_root", worktree_root),
+            )
         )
     directory = os.path.dirname(relative)
 
@@ -444,10 +563,13 @@ def parse_seam(text, path):
         )
     if not isinstance(seam["dirty"], bool):
         raise SeamError("seam field 'dirty' must be a boolean in %s" % path)
-    if seam["branch_ref"] is not None and not (
-        isinstance(seam["branch_ref"], str) and seam["branch_ref"].startswith("refs/")
-    ):
-        raise SeamError("seam field 'branch_ref' must be null or a refs/ path in %s" % path)
+    # Every string field is bounded here, before any of them can reach a
+    # message. A refusal names the field and the rule it broke, never the
+    # value: these messages ride into an agent's context via the SessionStart
+    # hook, so an unbounded manifest string must not survive this gate.
+    broken = branch_ref_rule_broken(seam["branch_ref"])
+    if broken:
+        raise SeamError("seam field 'branch_ref': %s (in %s)" % (broken, path))
     for key in (
         "git_common_dir",
         "handoff_path",
@@ -465,9 +587,10 @@ def parse_seam(text, path):
         raise SeamError("seam field 'status_sha256' is not a sha256 hex digest in %s" % path)
     if not SESSION_ID_RE.match(seam["session_id"]):
         raise SeamError("seam field 'session_id' is malformed in %s" % path)
-    for key in ("git_common_dir", "handoff_path", "worktree_git_dir", "worktree_root"):
-        if not os.path.isabs(seam[key]):
-            raise SeamError("seam field %r must be an absolute path in %s" % (key, path))
+    for key in PATH_KEYS:
+        broken = path_rule_broken(seam[key])
+        if broken:
+            raise SeamError("seam field %r: %s (in %s)" % (key, broken, path))
     return seam
 
 
@@ -480,7 +603,11 @@ def verify_file(handoff_path, anchor_dir, expected_session_id=None):
     if seam["handoff_path"] != actual:
         raise SeamError(
             "handoff file identity broken: sealed at %s, verifying %s "
-            "(moved or copied files cannot be trusted)" % (seam["handoff_path"], actual)
+            "(moved or copied files cannot be trusted)"
+            % (
+                _render_field("handoff_path", seam["handoff_path"]),
+                _render_field("handoff_path", actual),
+            )
         )
 
     diffs = []
@@ -498,8 +625,14 @@ def verify_file(handoff_path, anchor_dir, expected_session_id=None):
 
 
 def _describe(value):
+    """Render a value for the resume section written *into* the sealed file.
+
+    This is file content, not a diagnosis: the values come from a fresh capture
+    and must appear in full. Anything destined for a message or a --json reason
+    goes through _render_field instead, which bounds untrusted input.
+    """
     if value is None:
-        return "(detached)"
+        return DETACHED_TOKEN
     if value is True:
         return "true"
     if value is False:
@@ -523,13 +656,20 @@ def _reason_code(field):
 
 
 def drift_reason(key, sealed, current):
+    """One drift entry. `message` renders both sides through _render_field.
+
+    `sealed` comes out of an untrusted manifest, so the human-readable half of
+    this entry is bounded even though the structured `sealed`/`current` keys
+    carry the values a scripted caller asked for. parse_seam has already
+    refused anything unbounded, so those keys stay small too.
+    """
     return {
         "code": _reason_code(key),
         "field": key,
         "sealed": sealed,
         "current": current,
         "message": "%s: sealed=%s current=%s"
-        % (key, _describe(sealed), _describe(current)),
+        % (key, _render_field(key, sealed), _render_field(key, current)),
     }
 
 
@@ -676,10 +816,10 @@ def print_summary(prefix, seam, stream):
         "%s %s @ %s (%s, dirty=%s)"
         % (
             prefix,
-            seam["worktree_root"],
+            _render_field("worktree_root", seam["worktree_root"]),
             seam["head_oid"][:12],
-            _describe(seam["branch_ref"]),
-            _describe(seam["dirty"]),
+            _render_field("branch_ref", seam["branch_ref"]),
+            _render_field("dirty", seam["dirty"]),
         ),
         file=stream,
     )
@@ -767,7 +907,7 @@ def main(argv=None):
         for key, sealed, current in mismatch.diffs:
             print(
                 "  %-16s sealed=%s  current=%s"
-                % (key, _describe(sealed), _describe(current)),
+                % (key, _render_field(key, sealed), _render_field(key, current)),
                 file=sys.stderr,
             )
         print(

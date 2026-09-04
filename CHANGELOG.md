@@ -27,16 +27,45 @@
 * The `SessionStart` hook reads its verdict through `verify --json` and renders
   the drifted fields as a list. Same verdict semantics, same silence about the
   prose.
+* The `SessionStart` hook now hard-caps what it forwards into
+  `additionalContext` at 2 KB, appending `[handoff-seam: diagnosis truncated]`
+  when it clamps. This is defense in depth on top of the CLI's own bounds. The
+  verdict word and the "do NOT trust its contents" warning lead the string, so a
+  clamped context still carries the same instruction.
+* A checked-out ref outside `refs/[A-Za-z0-9._/+-]{1,255}` can no longer be
+  sealed — notably a branch name with non-ASCII characters or a space. `seal`
+  and `capture` refuse it up front, naming the rule, rather than writing a
+  manifest that `verify` would later reject. Widening the character class is a
+  candidate for schema v2; it needs a bound that stays safe to render into an
+  agent's context.
 * CI: `actions/checkout` pinned to a full commit SHA, plus job `timeout-minutes`
   and `concurrency` cancellation.
 
 ### Fixed
 
-* Refusal messages no longer quote a value out of the handoff manifest. A
-  `schema_version` is rendered as a decimal of at most 20 characters or as the
-  fixed token `non-integer` / `out-of-range`, so a hostile file cannot push
-  arbitrary text through a diagnosis into an agent's context by way of the
-  `SessionStart` hook.
+* **Every string field in the handoff manifest is now bounded before it can
+  reach a refusal message.** `handoff_path`, `worktree_root`, `git_common_dir`
+  and `worktree_git_dir` must be absolute, at most 4096 bytes, and free of
+  control characters; `branch_ref` must be `null` or `refs/` followed by 1–255
+  characters from `[A-Za-z0-9._/+-]`; `head_oid`, `status_sha256` and
+  `session_id` keep their existing patterns. A field that breaks a rule is a
+  structural refusal (exit 2) naming only the field and the rule — for example
+  `seam field 'worktree_root': not an absolute path` — never the value.
+
+  Those five fields were previously interpolated raw into refusal messages, and
+  the `SessionStart` hook renders such messages verbatim into an agent's
+  `additionalContext`. A manifest carrying a 198 KB `worktree_root` put all
+  198 KB of attacker-chosen text into that context; the same held for the other
+  four fields. The `schema_version` bound added earlier in this same Unreleased
+  section covered only that one field, so the note claiming refusal messages no
+  longer quote the manifest was not true of the tool as a whole. It is now.
+* A seam value that does legitimately reach a message or a `--json` reason goes
+  through a single renderer: a value that passed validation is emitted capped at
+  200 characters with an ellipsis, and anything else becomes the fixed token
+  `<invalid>`. A valid-but-huge path can no longer bloat the context either.
+* `capture` and `seal` apply the same bounds to the state they are about to
+  seal, so a successful `seal` can no longer produce a file that `verify` then
+  refuses structurally.
 * An unreadable or missing path is now a structural refusal (exit 2) with a
   one-line message, in both output modes. It previously escaped `main` as an
   `OSError` traceback and exited 1, the drift code, breaking the `--json`

@@ -74,6 +74,23 @@ import json, sys
 
 verdict, path, detail = sys.argv[1], sys.argv[2], sys.argv[3]
 
+# Defense in depth. The CLI already bounds every value it quotes out of an
+# untrusted manifest, but this hook writes straight into an agent's context, so
+# it caps what it forwards regardless of what the CLI handed it. The verdict
+# word and the "do NOT trust" warning lead the string, so a truncated context
+# still carries the same instruction.
+MAX_CONTEXT_BYTES = 2048
+TRUNCATION_MARKER = "\n[handoff-seam: diagnosis truncated]"
+
+
+def clamp(text):
+    encoded = text.encode("utf-8")
+    if len(encoded) <= MAX_CONTEXT_BYTES:
+        return text
+    marker = TRUNCATION_MARKER.encode("utf-8")
+    keep = encoded[: MAX_CONTEXT_BYTES - len(marker)]
+    return keep.decode("utf-8", "ignore") + TRUNCATION_MARKER
+
 
 def render(raw):
     """Bullet the --json reasons; fall back to raw output when it is not JSON."""
@@ -105,7 +122,7 @@ print(
         {
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": context,
+                "additionalContext": clamp(context),
             }
         }
     )
