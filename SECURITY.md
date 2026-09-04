@@ -43,7 +43,11 @@ In scope — these are bugs, and security bugs:
   exactly-one-seam-block rule, the submodule refusal, or the size and deadline caps.
 * A refusal quoting the file back: a diagnosis, `--json` reason, or hook verdict
   that carries attacker-chosen bytes out of an untrusted manifest. Those messages
-  reach an agent's context, so they must stay bounded and self-authored.
+  reach an agent's context, so they must stay bounded and self-authored. Every
+  manifest field is validated before it can reach a message; a refusal names the
+  field and the rule it broke, not the value; a rendered value is capped at 200
+  characters; and the `SessionStart` hook clamps its own output at 2 KB. Any path
+  around those bounds is in scope.
 * Writing anywhere but the handoff file being sealed, or mutating the repository.
 * Crash, hang, or resource exhaustion reachable from a hostile handoff file or
   repository state within the documented caps.

@@ -625,5 +625,140 @@ class SeamTestCase(unittest.TestCase):
         self.assertEqual(reason["current"], "other9")
 
 
+    # ------------------------------------------------------------------ bounded manifest strings
+
+    MANIFEST_STRING_FIELDS = (
+        "branch_ref",
+        "git_common_dir",
+        "handoff_path",
+        "worktree_git_dir",
+        "worktree_root",
+    )
+
+    def assert_payload_absent(self, payload, *blobs):
+        """No 64-byte window of an attacker payload may appear in any surface."""
+        middle = len(payload) // 2
+        windows = (payload[:64], payload[middle : middle + 64], payload[-64:])
+        for blob in blobs:
+            for window in windows:
+                self.assertNotIn(window, blob)
+
+    def refuse_hostile_field(self, field, payload):
+        """Tamper one manifest string, then prove no byte of it escapes.
+
+        Checks all three surfaces a refusal can reach: human stderr, the --json
+        report, and the SessionStart hook's additionalContext.
+        """
+        repo = self.make_repo("repo-" + field)
+        handoff = self.seal_in_claude_dir(repo)
+        value = ("refs/" if field == "branch_ref" else "/") + payload
+        self.tamper_seam(handoff, lambda seam: dict(seam, **{field: value}))
+
+        human = self.cli("verify", str(handoff), cwd=repo)
+        self.assertEqual(human.returncode, 2, msg=human.stderr[:300])
+        self.assertEqual(human.stdout, "")
+
+        machine = self.cli("verify", str(handoff), "--json", cwd=repo)
+        self.assertEqual(machine.returncode, 2)
+        self.assertEqual(machine.stderr, "", msg="--json must leave stderr empty")
+        report = json.loads(machine.stdout)
+        self.assertIsNone(report["seam"])
+        self.assertEqual(len(report["reasons"]), 1)
+        reason = report["reasons"][0]
+        self.assertEqual(reason["code"], "structural")
+        # The message names the field and the rule it broke, and nothing else.
+        self.assertIn(field, reason["message"])
+        self.assertLess(len(reason["message"]), 300)
+
+        context = self.hook_context(repo)
+        self.assertIn("FAILED seam verification", context)
+        self.assert_payload_absent(
+            payload, human.stdout, human.stderr, machine.stdout, context
+        )
+
+    def test_oversized_manifest_string_is_refused_without_echo(self):
+        # ~198 KB, comfortably inside the 256 KiB handoff cap: large enough to
+        # bury an instruction in an agent's context if any of it were quoted.
+        payload = HOSTILE * 6000
+        for field in self.MANIFEST_STRING_FIELDS:
+            with self.subTest(field=field):
+                self.refuse_hostile_field(field, payload)
+
+    def test_control_characters_in_a_manifest_string_are_refused(self):
+        # Short enough to clear every length rule, so the control-character
+        # rule is what actually rejects it. The escape would otherwise reach a
+        # terminal rendering the hook's context.
+        payload = HOSTILE * 2 + "\x1b]0;pwned\x07" + HOSTILE * 2
+        for field in self.MANIFEST_STRING_FIELDS:
+            with self.subTest(field=field):
+                self.refuse_hostile_field(field, payload)
+
+    def test_valid_but_long_path_is_truncated_in_a_drift_message(self):
+        repo = self.make_repo()
+        handoff = self.seal_in_claude_dir(repo)
+        long_path = "/" + "d" * 499  # absolute, no control bytes, under 4 KiB
+        self.assertEqual(len(long_path), 500)
+        self.tamper_seam(handoff, lambda seam: dict(seam, git_common_dir=long_path))
+
+        # A well-formed value drifts rather than failing structurally, and the
+        # drift entry still renders it capped — a valid path cannot bloat the
+        # context either.
+        report = self.json_cli("verify", str(handoff), cwd=repo, code=1)
+        entries = [r for r in report["reasons"] if r["field"] == "git_common_dir"]
+        self.assertEqual(len(entries), 1)
+        message = entries[0]["message"]
+        self.assertNotIn(long_path, message)
+        sealed = message.split("sealed=")[1].split(" current=")[0]
+        self.assertEqual(len(sealed), 200)
+        self.assertTrue(sealed.endswith("..."), msg=sealed[-8:])
+        self.assertTrue(sealed.startswith("/" + "d" * 100))
+
+        context = self.hook_context(repo)
+        self.assertNotIn(long_path, context)
+
+    def test_valid_but_long_path_is_truncated_in_a_structural_refusal(self):
+        repo = self.make_repo()
+        handoff = self.seal_in_claude_dir(repo)
+        long_path = "/" + "e" * 499
+        self.tamper_seam(handoff, lambda seam: dict(seam, worktree_root=long_path))
+        report = self.json_cli("verify", str(handoff), cwd=repo, code=2)
+        message = report["reasons"][0]["message"]
+        self.assertIn("not inside worktree", message)
+        self.assertNotIn(long_path, message)
+        self.assertIn("...", message)
+        self.assertLess(len(message), 500)
+
+    def test_hook_caps_the_bytes_it_forwards_into_context(self):
+        # Defense in depth: the hook clamps its own output whatever the CLI
+        # hands it. Six drifted fields under a deep repository path push the
+        # rendered verdict past the cap.
+        deep = self.tmp
+        for _ in range(5):
+            deep = deep / ("d" * 100)
+        deep.mkdir(parents=True)
+        self.git(deep, "init", "-q", "-b", "main")
+        (deep / "file.txt").write_text("tracked content\n")
+        self.git(deep, "add", ".")
+        self.git(deep, "commit", "-q", "-m", "initial")
+        handoff = self.seal_in_claude_dir(deep)
+        self.tamper_seam(
+            handoff,
+            lambda seam: dict(
+                seam,
+                branch_ref="refs/heads/" + "z" * 244,
+                dirty=not seam["dirty"],
+                git_common_dir="/" + "g" * 499,
+                head_oid="deadbeef" * 5,
+                status_sha256="a" * 64,
+                worktree_git_dir="/" + "w" * 499,
+            ),
+        )
+        context = self.hook_context(deep)
+        self.assertIn("FAILED seam verification", context)
+        self.assertIn("Do NOT trust", context)
+        self.assertLessEqual(len(context.encode("utf-8")), 2048)
+        self.assertTrue(context.endswith("[handoff-seam: diagnosis truncated]"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ fail-closed gate, not a cryptographic authentication system.
 | Symlink swap / file-type swap while reading or sealing | `O_NOFOLLOW`, regular-file checks, dev/ino re-checks, atomic temp + rename with a pre-replace identity check |
 | Shallow submodule ambiguity | Dirty submodule state is refused (exit 2) instead of being fingerprinted incompletely |
 | Fingerprinting hanging or exploding | 30 s capture deadline; 2 MB status / 25 MB diff / 25 MB untracked caps — exceeding any is a refusal, never a partial fingerprint |
+| A hostile manifest pushing attacker-chosen text into an agent's context through a refusal message | Every manifest string is bounded before it can reach a message (absolute paths ≤ 4096 B and free of control characters, `branch_ref` a bounded `refs/` path); a refusal names the field and the rule it broke, never the value; a rendered value is capped at 200 characters; the `SessionStart` hook clamps its own output at 2 KB |
 
 ## What it explicitly does NOT defend against
 
@@ -35,8 +36,8 @@ fail-closed gate, not a cryptographic authentication system.
   make a hostile kernel-adjacent environment safe.
 * **Secrets in the prose.** The seam adds only git metadata, but the handoff
   body is user-authored; sealing does not sanitize it. The verdict surfaces
-  emit seam fields and paths, never prose — but the sealed file itself is as
-  sensitive as what you wrote into it.
+  emit bounded seam fields and paths, never prose — but the sealed file itself
+  is as sensitive as what you wrote into it.
 * **Clock or ordering claims.** The seam proves state equality, not when the
   seal happened. There is no timestamp field by design (nothing verifies it).
 
